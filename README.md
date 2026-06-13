@@ -8,9 +8,9 @@
 
 **书籍**
 - 浏览微信读书书架，搜索书籍
-- 下载单章、前 N 章或整本书为 EPUB，直接在 KOReader 中阅读
+- 下载单章或整本书为 EPUB，直接在 KOReader 中阅读
 - 章节内容解码、CSS 样式、图片资源打包
-- 自动生成目录（TOC）
+- 自动生成目录（TOC），自动嵌入封面
 
 **公众号**
 - 浏览已关注的公众号列表
@@ -181,12 +181,20 @@ weread.koplugin/
 ├── main.lua               入口、UI、业务逻辑
 ├── config.example.lua     配置模板
 ├── config.lua             用户配置（git 忽略）
-└── lib/
-    ├── client.lua          HTTP 客户端
-    ├── content.lua         内容解码、EPUB/HTML 生成
-    ├── cookie.lua          Cookie 解析
-    ├── crypto.lua          SHA-256、MD5
-    ├── i18n.lua            中文翻译
-    ├── settings.lua        设置持久化
-    └── weread.lua          微信读书协议工具
+├── CLAUDE.md              开发规范
+├── lib/
+│   ├── client.lua          HTTP 客户端
+│   ├── content.lua         内容解码、EPUB/HTML 生成
+│   ├── cookie.lua          Cookie 解析
+│   ├── crypto.lua          SHA-256、MD5
+│   ├── download_dialog.lua 下载进度对话框
+│   ├── i18n.lua            中文翻译
+│   ├── settings.lua        设置持久化
+│   └── weread.lua          微信读书协议工具
+├── scripts/
+│   ├── fetch_weread_epub.py     EPUB 生成参考脚本
+│   └── verify_mp_articles.py    公众号 API 验证脚本
+└── docs/
+    ├── weread-api-reference.md      API 接口参考
+    └── weread-content-research.md   内容解码研究
 ```
