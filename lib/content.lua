@@ -5,6 +5,7 @@ local ok_logger, logger = pcall(require, "logger")
 if not ok_logger then
     logger = nil
 end
+local LOG_MODULE = "[WeRead]"
 
 local Content = {}
 
@@ -921,7 +922,7 @@ function Content.fetch_chapter_epub(client, settings, book, chapter)
     local css = Content.fetch_chapter_css(client, settings, book, chapter)
     local assets = {}
     local cache = settings:get("cache", {})
-    if cache.download_images then
+    if cache.download_book_images then
         local used_names = {}
         local src_map
         assets, src_map = Content.download_chapter_assets(client, book, chapter, used_names)
@@ -950,7 +951,7 @@ function Content.fetch_single_chapter_content(client, settings, book, chapter, s
     end
     local chapter_assets = {}
     local cache = settings:get("cache", {})
-    if cache.download_images then
+    if cache.download_book_images then
         state.used_asset_names = state.used_asset_names or {}
         local tar_assets, src_map = Content.download_chapter_assets(client, book, chapter, state.used_asset_names)
         for _, asset in ipairs(tar_assets) do
@@ -983,7 +984,7 @@ function Content.fetch_chapters_epub(client, settings, book, chapters, options)
         if not css then
             css = Content.fetch_chapter_css(client, settings, book, chapter)
         end
-        if cache.download_images then
+        if cache.download_book_images then
             if options.progress then
                 options.progress(chapter_index, #chapters, chapter, "images")
             end
@@ -1158,6 +1159,18 @@ local function strip_mp_reader_font_styles(html)
     end)
 end
 
+function Content.strip_mp_images(html)
+    html = tostring(html or "")
+    html = html:gsub(
+        "<[pP][iI][cC][tT][uU][rR][eE][^>]*>.-</[pP][iI][cC][tT][uU][rR][eE]%s*>",
+        ""
+    )
+    html = html:gsub("<[iI][mM][gG][^>]*>", "")
+    html = html:gsub("</[iI][mM][gG]%s*>", "")
+    html = html:gsub("<[sS][oO][uU][rR][cC][eE][^>]*>", "")
+    return html
+end
+
 local function strip_blank_mp_blocks(html)
     html = tostring(html or "")
     html = html:gsub("<mp%-common%-profile[^>]->.-</mp%-common%-profile>", "")
@@ -1170,7 +1183,7 @@ local function strip_blank_mp_blocks(html)
 
     for _ = 1, 12 do
         local previous = html
-        for _, tag in ipairs({ "span", "p", "section", "div" }) do
+        for _, tag in ipairs({ "a", "span", "p", "section", "div", "figure", "picture" }) do
             html = html:gsub("<" .. tag .. "[^>]->%s*<br/>%s*</" .. tag .. ">", "")
             html = html:gsub("<" .. tag .. "[^>]->%s*</" .. tag .. ">", "")
         end
@@ -1348,7 +1361,7 @@ function Content.fetch_mp_article_html(client, settings, book, article, opts)
     local html, meta, used_review_id
     local attempts = {}
     local function fetch_candidates(prefix, request_opts)
-        for _, review_id in ipairs(candidate_ids) do
+        for candidate_index, review_id in ipairs(candidate_ids) do
             local ok, candidate_html, candidate_meta = pcall(function()
                 return client:get_mp_content(review_id, {
                     referer = referer,
@@ -1358,7 +1371,7 @@ function Content.fetch_mp_article_html(client, settings, book, article, opts)
             if ok then
                 table.insert(
                     attempts,
-                    prefix .. review_id .. ":" .. tostring(candidate_meta and candidate_meta.length or #(candidate_html or ""))
+                    prefix .. tostring(candidate_index) .. ":" .. tostring(candidate_meta and candidate_meta.length or #(candidate_html or ""))
                 )
                 if candidate_html and not candidate_html:match("^%s*$") then
                     html = candidate_html
@@ -1368,7 +1381,7 @@ function Content.fetch_mp_article_html(client, settings, book, article, opts)
                 end
                 meta = meta or candidate_meta
             else
-                table.insert(attempts, prefix .. review_id .. ":error")
+                table.insert(attempts, prefix .. tostring(candidate_index) .. ":error")
             end
         end
         return false
@@ -1377,7 +1390,7 @@ function Content.fetch_mp_article_html(client, settings, book, article, opts)
     fetch_candidates("")
     if not html or html:match("^%s*$") then
         if logger then
-            logger.info("WeRead: MP content empty, renewing cookie before retry")
+            logger.info(LOG_MODULE, "MP content empty, renewing cookie before retry")
         end
         local renew_ok = pcall(function()
             return client:renew_cookie()
@@ -1403,23 +1416,18 @@ function Content.fetch_mp_article_html(client, settings, book, article, opts)
     end
     local body = Content.extract_mp_body(html)
     if not body then
-        local preview = tostring(html or ""):sub(1, 300)
         local empty_response = not html or html:match("^%s*$") ~= nil
         if logger then
             logger.warn(
-                "WeRead: could not extract MP article body:",
+                LOG_MODULE,
+                "could not extract MP article body:",
                 "reason=", empty_response and "empty_response" or "missing_body",
-                "reviewId=", tostring(article and article.reviewId or ""),
-                "usedReviewId=", tostring(used_review_id or ""),
-                "originalId=", tostring(article and article.originalId or ""),
-                "bookId=", tostring(book_id or ""),
-                "title=", tostring(article and article.title or ""),
+                "candidate_count=", tostring(#candidate_ids),
+                "used_candidate=", used_review_id and "yes" or "no",
                 "html_length=", tostring(meta and meta.length or #(html or "")),
                 "content_type=", tostring(meta and meta.content_type or ""),
-                "referer=", tostring(referer or ""),
                 "attempts=", table.concat(attempts, ","),
-                "has_source_url=", source_url ~= "" and "yes" or "no",
-                "html_preview=", preview
+                "has_source_url=", source_url ~= "" and "yes" or "no"
             )
         end
         if empty_response then
@@ -1428,8 +1436,10 @@ function Content.fetch_mp_article_html(client, settings, book, article, opts)
         error("Could not extract article body. See KOReader log for details.", 0)
     end
     local cache = settings:get("cache", {})
-    if cache.download_images then
+    if cache.download_mp_images then
         body = Content.download_mp_images(client, body, opts.progress, true)
+    else
+        body = Content.strip_mp_images(body)
     end
     return Content.save_mp_article_html(settings, book, article, body)
 end

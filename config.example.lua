@@ -36,7 +36,8 @@ return {
 
     -- 缓存设置
     cache = {
-        download_images = true,    -- 下载章节/文章中的图片
+        download_book_images = true, -- 下载书籍章节中的图片
+        download_mp_images = false,  -- 下载公众号文章中的图片
         max_size_mb = 1024,
     },
 

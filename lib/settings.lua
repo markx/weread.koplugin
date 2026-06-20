@@ -8,6 +8,10 @@ Settings.__index = Settings
 local defaults = {
     api_key = "",
     cookies = {},
+    wr_ticket = "",
+    wr_wrpa = "",
+    config_auth_fingerprint = "",
+    config_preferences_fingerprint = "",
     curl_payload = {},
     books = {},
     downloads = {},
@@ -18,7 +22,8 @@ local defaults = {
         upload_interval_minutes = 0,
     },
     cache = {
-        download_images = true,
+        download_book_images = true,
+        download_mp_images = false,
         max_size_mb = 1024,
     },
     read_report = {
@@ -65,6 +70,24 @@ function Settings:new()
     }
     ensure_dir(obj.cache_dir)
     obj.store = LuaSettings:open(obj.settings_file)
+    local cache = obj.store:readSetting("cache", deepcopy(defaults.cache))
+    local cache_changed = false
+    if cache.download_book_images == nil then
+        cache.download_book_images = cache.download_images ~= false
+        cache_changed = true
+    end
+    if cache.download_mp_images == nil then
+        cache.download_mp_images = false
+        cache_changed = true
+    end
+    if cache.download_images ~= nil then
+        cache.download_images = nil
+        cache_changed = true
+    end
+    if cache_changed then
+        obj.store:saveSetting("cache", cache)
+        obj.store:flush()
+    end
     return setmetatable(obj, self)
 end
 
@@ -94,6 +117,8 @@ end
 function Settings:reset_account()
     self:set("api_key", "")
     self:set("cookies", {})
+    self:set("wr_ticket", "")
+    self:set("wr_wrpa", "")
     self:set("curl_payload", {})
     self:flush()
 end
@@ -107,28 +132,35 @@ function Settings:is_api_configured()
     return self:get("api_key", "") ~= ""
 end
 
-function Settings:apply_config(config)
+function Settings:apply_config(config, options)
+    options = options or {}
     if type(config) ~= "table" then
         return false, "config must return a table"
     end
-    if type(config.api_key) == "string" and config.api_key ~= "" then
+    if type(config.api_key) == "string" then
         self:set("api_key", config.api_key)
     end
-    if type(config.sync) == "table" then
+    if options.apply_preferences ~= false and type(config.sync) == "table" then
         local sync = self:get("sync")
         for key, value in pairs(config.sync) do
             sync[key] = value
         end
         self:set("sync", sync)
     end
-    if type(config.cache) == "table" then
+    if options.apply_preferences ~= false and type(config.cache) == "table" then
         local cache = self:get("cache")
         for key, value in pairs(config.cache) do
-            cache[key] = value
+            if key ~= "download_images" then
+                cache[key] = value
+            end
         end
+        if config.cache.download_book_images == nil and config.cache.download_images ~= nil then
+            cache.download_book_images = config.cache.download_images
+        end
+        cache.download_images = nil
         self:set("cache", cache)
     end
-    if type(config.read_report) == "table" then
+    if options.apply_preferences ~= false and type(config.read_report) == "table" then
         local rr = self:get("read_report")
         if config.read_report.interval_seconds then
             rr.interval_seconds = config.read_report.interval_seconds
@@ -145,7 +177,7 @@ function Settings:apply_config(config)
         end
         self:set("read_report", rr)
     end
-    if type(config.shelf) == "table" then
+    if options.apply_preferences ~= false and type(config.shelf) == "table" then
         local shelf = self:get("shelf")
         for key, value in pairs(config.shelf) do
             shelf[key] = value

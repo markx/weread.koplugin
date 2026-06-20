@@ -26,6 +26,47 @@ local function header_value(headers, name)
     return nil
 end
 
+local function scalar_header_value(headers, name)
+    local value = header_value(headers, name)
+    if type(value) == "table" then
+        for _, item in pairs(value) do
+            return tostring(item)
+        end
+        return nil
+    end
+    return value
+end
+
+local function http_error(client, code, text, headers)
+    text = text or ""
+    local content_type = tostring(header_value(headers, "content-type") or "unknown")
+    local parts = {
+        "HTTP " .. tostring(code),
+        "content_type=" .. content_type,
+        "body_bytes=" .. tostring(#text),
+    }
+    local looks_like_json = content_type:lower():find("json", 1, true)
+        or text:match("^%s*{") ~= nil
+        or text:match("^%s*%[") ~= nil
+    if looks_like_json and #text <= 65536 then
+        local ok, data = pcall(function()
+            return client:json_decode(text)
+        end)
+        if ok and type(data) == "table" then
+            local err_code = data.errCode or data.errcode or data.code
+            local err_message = data.errMsg or data.errmsg or data.message or data.msg
+            if err_code ~= nil then
+                table.insert(parts, "error_code=" .. tostring(err_code))
+            end
+            if err_message ~= nil then
+                local message = tostring(err_message):gsub("[%c]+", " "):sub(1, 200)
+                table.insert(parts, "error_message=" .. message)
+            end
+        end
+    end
+    return table.concat(parts, ", ")
+end
+
 local function absolute_url(base_url, location)
     if not location or location == "" then
         return nil
@@ -154,7 +195,7 @@ function Client:post_json(url, data, opts)
     if code and code >= 200 and code < 300 then
         return self:json_decode(text), code, resp_headers
     end
-    error(("HTTP %s: %s"):format(tostring(code), text or ""))
+    error(http_error(self, code, text, resp_headers))
 end
 
 function Client:get_text(url, opts)
@@ -178,7 +219,7 @@ function Client:get_text(url, opts)
     if code and code >= 200 and code < 300 then
         return text
     end
-    error(("HTTP %s: %s"):format(tostring(code), text or ""))
+    error(http_error(self, code, text, resp_headers))
 end
 
 function Client:get_public_text(url, opts)
@@ -199,7 +240,7 @@ function Client:get_public_text(url, opts)
             url = url,
         }
     end
-    error(("HTTP %s: %s"):format(tostring(code), text and text:sub(1, 200) or ""))
+    error(http_error(self, code, text, resp_headers))
 end
 
 function Client:get_binary(url, opts)
@@ -228,14 +269,29 @@ function Client:get_binary(url, opts)
     if code and code >= 200 and code < 300 then
         return text, code, resp_headers
     end
-    error(("HTTP %s: %s"):format(tostring(code), text or ""))
+    error(http_error(self, code, text, resp_headers))
 end
 
 function Client:renew_cookie()
-    return self:post_json("https://weread.qq.com/web/login/renewal", {
+    local result, code, resp_headers = self:post_json("https://weread.qq.com/web/login/renewal", {
         rq = "%2Fweb%2Fbook%2Fread",
         ql = false,
     })
+    local changed = false
+    local wr_ticket = scalar_header_value(resp_headers, "x-wr-ticket")
+    if wr_ticket and wr_ticket ~= "" then
+        self.settings:set("wr_ticket", wr_ticket)
+        changed = true
+    end
+    local wr_wrpa = scalar_header_value(resp_headers, "x-wrpa-0")
+    if wr_wrpa and wr_wrpa ~= "" then
+        self.settings:set("wr_wrpa", wr_wrpa)
+        changed = true
+    end
+    if changed then
+        self.settings:flush()
+    end
+    return result, code, resp_headers
 end
 
 function Client:gateway(api_name, params)
@@ -296,7 +352,7 @@ function Client:get_mp_articles(book_id, max_idx, count, wr_ticket)
         end
         return data, nil
     end
-    error(("HTTP %s: %s"):format(tostring(code), text or ""))
+    error(http_error(self, code, text, resp_headers))
 end
 
 function Client:get_mp_content(review_id, opts)
@@ -337,7 +393,7 @@ function Client:get_mp_content(review_id, opts)
             url = url,
         }
     end
-    error(("HTTP %s: %s"):format(tostring(code), text and text:sub(1, 200) or ""))
+    error(http_error(self, code, text, resp_headers))
 end
 
 function Client:report_read(payload, referer)
