@@ -1559,20 +1559,71 @@ function WeReadPlugin:showBookshelf()
     if not self:requireLogin(true, true) then
         return
     end
-    self:showBusy(_("Loading bookshelf..."))
-    self:runOnlineTask(_("Bookshelf"), function()
-        local ok, result = pcall(function()
-            return self.client:gateway("/shelf/sync", {})
+
+    local cached = self.settings:get("shelf_cache")
+    if cached and cached.books then
+        logger.info(LOG_MODULE, "Loading bookshelf from local cache")
+        self:parseAndShowShelf(cached.books)
+
+        -- Trigger background refresh
+        UIManager:scheduleIn(0.5, function()
+            self:refreshBookshelfInBackground()
         end)
-        if not ok then
+    else
+        self:showBusy(_("Loading bookshelf..."))
+        self:runOnlineTask(_("Bookshelf"), function()
+            local ok, result = pcall(function()
+                return self.client:gateway("/shelf/sync", {})
+            end)
+            if not ok then
+                self:closeBusy()
+                logger.err(LOG_MODULE, "load bookshelf failed:", log_error(result))
+                self:showInfo(T(_("Load bookshelf failed:\n%1"), display_error(result)))
+                return
+            end
+            local all_books = result.books or {}
+            self.settings:set("shelf_cache", { books = all_books, time = os.time() })
+            self.settings:flush()
+
             self:closeBusy()
-            logger.err(LOG_MODULE, "load bookshelf failed:", log_error(result))
-            self:showInfo(T(_("Load bookshelf failed:\n%1"), display_error(result)))
-            return
+            self:parseAndShowShelf(all_books)
+        end)
+    end
+end
+
+function WeReadPlugin:parseAndShowShelf(all_books)
+    local shelf = self.settings:get("shelf")
+    self.shelf_filters = { reading = shelf.filter_reading, download = shelf.filter_download }
+    self.shelf_regular = {}
+    self.shelf_mp = {}
+    for _i, book in ipairs(all_books) do
+        if WeRead.is_mp_book(book.bookId) then
+            table.insert(self.shelf_mp, book)
+        else
+            table.insert(self.shelf_regular, book)
         end
-        local all_books = result.books or {}
-        local shelf = self.settings:get("shelf")
-        self.shelf_filters = { reading = shelf.filter_reading, download = shelf.filter_download }
+    end
+    self.shelf_books = self.shelf_regular
+
+    if #self.shelf_mp > 0 then
+        self.shelf_menu = self:showShelfTabs()
+    else
+        self.shelf_menu = self:showShelfPage()
+    end
+end
+
+function WeReadPlugin:refreshBookshelfInBackground()
+    local NetworkMgr = require("ui/network/manager")
+    if not NetworkMgr:isOnline() then return end
+
+    local ok, result = pcall(function()
+        return self.client:gateway("/shelf/sync", {})
+    end)
+    if ok and result and result.books then
+        local all_books = result.books
+        self.settings:set("shelf_cache", { books = all_books, time = os.time() })
+        self.settings:flush()
+
         self.shelf_regular = {}
         self.shelf_mp = {}
         for _i, book in ipairs(all_books) do
@@ -1583,13 +1634,28 @@ function WeReadPlugin:showBookshelf()
             end
         end
         self.shelf_books = self.shelf_regular
-        self:closeBusy()
-        if #self.shelf_mp > 0 then
-            self:showShelfTabs()
-        else
-            self:showShelfPage()
+
+        -- Refresh the menu in place if the user is currently actively viewing it
+        if self.shelf_menu and UIManager:isSubwidgetShown(self.shelf_menu) then
+            local page_type = self._shelf_page_type
+            UIManager:close(self.shelf_menu)
+            if page_type == "tabs" then
+                self.shelf_menu = self:showShelfTabs()
+            elseif page_type == "regular" then
+                self.shelf_menu = self:showShelfPage()
+            elseif page_type == "mp" then
+                self.shelf_menu = self:showMPShelfPage()
+            else
+                if #self.shelf_mp > 0 then
+                    self.shelf_menu = self:showShelfTabs()
+                else
+                    self.shelf_menu = self:showShelfPage()
+                end
+            end
+            local Notification = require("ui/widget/notification")
+            Notification:notify(_("WeRead: Bookshelf updated"), Notification.SOURCE_ALWAYS_SHOW)
         end
-    end)
+    end
 end
 
 local function sortBooks(books, sort_order)
@@ -1672,6 +1738,7 @@ function WeReadPlugin:showShelfPage()
     menu = self:showList(_("WeRead Bookshelf"), buildItems(), _("Your WeRead shelf is empty."))
     self.shelf_menu = menu
     self._shelf_refresh = refresh
+    self._shelf_page_type = "regular"
 end
 
 function WeReadPlugin:refreshShelfCacheIndicators()
@@ -1860,7 +1927,9 @@ function WeReadPlugin:showShelfTabs()
             end),
         },
     }
-    self:showList(_("WeRead Bookshelf"), items, _("Your WeRead shelf is empty."))
+    self._shelf_page_type = "tabs"
+    self._shelf_menu = self:showList(_("WeRead Bookshelf"), items, _("Your WeRead shelf is empty."))
+    return self._shelf_menu
 end
 
 function WeReadPlugin:showMPShelfPage()
@@ -1885,7 +1954,9 @@ function WeReadPlugin:showMPShelfPage()
         end
         return items
     end
-    menu = self:showList(_("Public Accounts"), buildItems(), _("No items."))
+    self.shelf_menu = self:showList(_("Public Accounts"), buildItems(), _("No items."))
+    self._shelf_page_type = "mp"
+    return self.shelf_menu
 end
 
 function WeReadPlugin:showMPAccount(book)
