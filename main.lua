@@ -730,11 +730,9 @@ function WeReadPlugin:clearAllMPCache()
 end
 
 function WeReadPlugin:clearAllCache()
-    local cache_dir = self.settings.cache_dir
-    os.execute("rm -rf " .. string.format("%q", cache_dir))
-    os.execute("mkdir -p " .. string.format("%q", cache_dir))
     local books = self.settings:get("books", {})
     for book_id, book in pairs(books) do
+        os.execute("rm -rf " .. string.format("%q", Content.book_cache_dir(self.settings, book_id)))
         book.cached_file = nil
         book.cached_chapters = nil
         book.mp_articles = nil
