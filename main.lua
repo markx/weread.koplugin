@@ -1070,9 +1070,10 @@ function WeReadPlugin:detectWeReadBook()
     if not file then
         return nil
     end
-    local cache_dir = self.settings.cache_dir
-    if file:sub(1, #cache_dir) == cache_dir then
-        local rest = file:sub(#cache_dir + 2)
+    -- Require a path boundary after the cache dir
+    local prefix = self.settings.cache_dir:gsub("/+$", "") .. "/"
+    if file:sub(1, #prefix) == prefix then
+        local rest = file:sub(#prefix + 1)
         local book_id = rest:match("^([^/]+)")
         return book_id
     end
