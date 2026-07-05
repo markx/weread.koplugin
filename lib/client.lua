@@ -418,4 +418,75 @@ function Client:report_read(payload, referer)
     })
 end
 
+function Client:get_chapter_underlines(book_id, chapter_uid)
+    if not book_id or tostring(book_id) == "" then
+        return false, nil, "empty book_id"
+    end
+    if not chapter_uid then
+        return false, nil, "empty chapter_uid"
+    end
+
+    local ok, result = pcall(function()
+        return self:gateway("/book/underlines", {
+            bookId = tostring(book_id),
+            chapterUid = chapter_uid,
+        })
+    end)
+    if not ok then
+        return false, nil, tostring(result)
+    end
+    if type(result) ~= "table" then
+        return false, nil, "underlines: gateway returned non-table"
+    end
+    return true, result
+end
+
+function Client:get_chapter_reviews(book_id, chapter_uid, ranges)
+    if not book_id or tostring(book_id) == "" then
+        return false, nil, "empty book_id"
+    end
+    if not chapter_uid then
+        return false, nil, "empty chapter_uid"
+    end
+    if type(ranges) ~= "table" or #ranges == 0 then
+        return true, { reviews = {} }
+    end
+
+    local BATCH_SIZE = 5
+    local all_reviews = {}
+    local socket_ok, socket = pcall(require, "socket")
+
+    for batch_start = 1, #ranges, BATCH_SIZE do
+        local batch = {}
+        for index = batch_start, math.min(batch_start + BATCH_SIZE - 1, #ranges) do
+            batch[#batch + 1] = {
+                range = ranges[index],
+                maxIdx = 0,
+                count = 30,
+                synckey = 0,
+            }
+        end
+
+        local ok, result = pcall(function()
+            return self:gateway("/book/readreviews", {
+                bookId = tostring(book_id),
+                chapterUid = chapter_uid,
+                reviews = batch,
+            })
+        end)
+
+        if ok and type(result) == "table" and type(result.reviews) == "table" then
+            for _, review in ipairs(result.reviews) do
+                all_reviews[#all_reviews + 1] = review
+            end
+        end
+
+        if batch_start + BATCH_SIZE <= #ranges and socket_ok and socket.sleep then
+            socket.sleep(0.3)
+        end
+    end
+
+    return true, { reviews = all_reviews }
+end
+
 return Client
