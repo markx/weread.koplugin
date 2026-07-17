@@ -22,11 +22,11 @@
 
 **阅读时间上报**
 
-- 后台自动向微信读书上报阅读时长（默认每 30 秒一次）
+- 自动向微信读书上报阅读时长（默认每 30 秒一次）
 - 支持两种目标书籍模式：
   - **自动关联**：打开微信读书缓存书籍时自动上报该书，关闭时自动停止
   - **手动设置**：从书架选择一本固定书籍作为上报对象
-- 支持「仅在阅读时上报」或「KOReader 启动即上报」两种触发模式
+- 支持「仅在阅读时上报」或「KOReader 启动即上报」两种触发模式，不检查翻页活动
 - 上报状态可在菜单中查看（已上报次数、最近上报时间、错误信息）
 
 **书籍管理**
@@ -111,7 +111,7 @@ koreader/plugins/weread.koplugin/
 ```
 weread.koplugin/
 ├── _meta.lua              插件元数据
-├── main.lua               入口、UI、业务逻辑
+├── main.lua               插件入口与 UI 接线
 ├── CLAUDE.md              开发规范
 ├── lib/
 │   ├── client.lua          HTTP 客户端
@@ -121,12 +121,16 @@ weread.koplugin/
 │   ├── download_dialog.lua 下载进度对话框
 │   ├── i18n.lua            中文翻译
 │   ├── qr_login.lua        扫码登录协议、状态机与凭证保存
+│   ├── read_report.lua     阅读时间上报状态机、会话刷新与重试
+│   ├── reader_state.lua    Web Reader 会话与阅读位置解析
 │   ├── settings.lua        设置持久化
 │   └── weread.lua          微信读书协议工具
 ├── scripts/
 │   ├── fetch_weread_epub.py     EPUB 生成参考脚本
 │   ├── verify_qr_login.py       扫码登录协议验证（不保存凭证）
-│   └── verify_mp_articles.py    公众号 API 验证脚本
+│   ├── verify_mp_articles.py    公众号 API 验证脚本
+│   ├── test_read_report.lua     阅读上报状态机回归测试
+│   └── test_reader_state.lua    Reader 会话解析回归测试
 └── docs/
     ├── weread-api-reference.md      API 接口参考
     └── weread-content-research.md   内容解码研究

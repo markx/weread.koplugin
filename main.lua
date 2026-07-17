@@ -17,9 +17,9 @@ local T = require("ffi/util").template
 
 local Client = require("lib.client")
 local Content = require("lib.content")
-local Crypto = require("lib.crypto")
 local I18n = require("lib.i18n")
 local QRLogin = require("lib.qr_login")
+local ReadReport = require("lib.read_report")
 local Settings = require("lib.settings")
 local Thoughts = require("lib.thoughts")
 local WeRead = require("lib.weread")
@@ -79,11 +79,28 @@ function WeReadPlugin:init()
     self.settings = Settings:new()
     self.client = Client:new(self.settings)
     self.qr_login = QRLogin:new(self, self.client, self.settings)
+    self.read_report = ReadReport:new{
+        settings = self.settings,
+        client = self.client,
+        scheduler = UIManager,
+        get_document = function()
+            return self.ui and self.ui.document
+        end,
+        detect_book = function()
+            return self:detectWeReadBook()
+        end,
+        is_online = function()
+            return self:isNetworkOnline()
+        end,
+    }
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
-    local rr = self.settings:get("read_report")
-    if rr.enabled and rr.mode == "manual" and rr.book_id ~= "" and not rr.report_on_open then
-        self:startReadReport(true)
+    local read_report = self.settings:get("read_report")
+    if read_report.enabled
+        and read_report.mode == "manual"
+        and read_report.book_id ~= ""
+        and read_report.report_on_open == false then
+        self.read_report:maybe_start("plugin_start")
     end
     ThoughtPopup.init()
     self._reader_session_gen = 0
@@ -1163,29 +1180,28 @@ function WeReadPlugin:getReadReportMenuItems()
         {
             text = _("Only report when reading"),
             checked_func = function()
-                return self.settings:get("read_report").report_on_open
+                return self.settings:get("read_report").report_on_open ~= false
             end,
             callback = self:safeCallback(_("Only report when reading"), function()
                 local cur = self.settings:get("read_report")
-                cur.report_on_open = not cur.report_on_open
+                cur.report_on_open = cur.report_on_open == false
                 self.settings:set("read_report", cur)
                 self.settings:flush()
+                self:stopReadReport("trigger_mode_changed")
                 if cur.enabled then
-                    local has_book = cur.mode == "auto" and self._auto_report_book_id or cur.book_id ~= ""
-                    if has_book then
-                        if cur.report_on_open and not self.ui.document then
-                            self:stopReadReport()
-                        else
-                            self:maybeStartReadReport()
-                        end
-                    end
+                    self:maybeStartReadReport()
                 end
             end),
         },
         {
-            text = _("Select target book"),
-            post_text = rr.mode == "auto" and _("Auto-associate")
-                or (rr.book_title ~= "" and T(_("Manual: %1"), rr.book_title) or _("Not configured")),
+            text_func = function()
+                local current = self.settings:get("read_report")
+                if current.mode == "manual" and current.book_title ~= "" then
+                    return _("Select target book") .. " · " .. current.book_title
+                end
+                return _("Select target book")
+            end,
+            post_text = rr.mode == "auto" and _("Auto-associate") or nil,
             sub_item_table_func = function()
                 return self:getReportTargetMenuItems()
             end,
@@ -1195,18 +1211,19 @@ function WeReadPlugin:getReadReportMenuItems()
             keep_menu_open = true,
             callback = self:safeCallback(_("Report status"), function()
                 local cur = self.settings:get("read_report")
+                local report_status = self.read_report:status()
                 local target
                 if cur.mode == "auto" then
-                    local auto_title = self._auto_report_book_title
+                    local auto_title = report_status.target_book_title
                     target = auto_title and T(_("Auto: %1"), auto_title) or _("Auto-associate")
                 else
                     target = cur.book_title ~= "" and cur.book_title or _("Not configured")
                 end
-                local status = self._report_task and _("Running") or _("Stopped")
-                local count = self._report_count or 0
-                local last = self._report_last_time
-                    and os.date("%H:%M:%S", self._report_last_time) or "--"
-                local err = self._report_last_error or ""
+                local status = report_status.running and _("Running") or _("Stopped")
+                local count = report_status.count
+                local last = report_status.last_time
+                    and os.date("%H:%M:%S", report_status.last_time) or "--"
+                local err = report_status.last_error or ""
                 local msg = T(_("Report book: %1\nStatus: %2"), target, status)
                     .. "\n" .. T(_("Reported: %1 times, last: %2"), tostring(count), last)
                 if err ~= "" then
@@ -1233,6 +1250,7 @@ function WeReadPlugin:getReportTargetMenuItems()
                 cur.book_title = ""
                 self.settings:set("read_report", cur)
                 self.settings:flush()
+                self:stopReadReport("target_changed")
                 if cur.enabled then
                     self:maybeStartReadReport()
                 end
@@ -1249,6 +1267,7 @@ function WeReadPlugin:getReportTargetMenuItems()
                 cur.mode = "manual"
                 self.settings:set("read_report", cur)
                 self.settings:flush()
+                self:stopReadReport("target_changed")
                 self:showReadReportBookPicker()
             end),
         },
@@ -1311,6 +1330,7 @@ function WeReadPlugin:showReadReportBookPicker()
                         rr.book_title = book.title or book.bookId
                         self.settings:set("read_report", rr)
                         self.settings:flush()
+                        self:stopReadReport("target_changed")
                         if self._picker_menu then
                             UIManager:close(self._picker_menu)
                             self._picker_menu = nil
@@ -2905,20 +2925,10 @@ function WeReadPlugin:onReaderReady()
         end)
     end
 
+    local _started, _title, reason = self.read_report:on_reader_ready()
     local rr = self.settings:get("read_report")
-    if rr.mode == "auto" and rr.enabled then
-        if weread_book_id then
-            self._auto_report_book_id = weread_book_id
-            local books = self.settings:get("books", {})
-            local book_record = books[weread_book_id]
-            self._auto_report_book_title = book_record and book_record.title or weread_book_id
-            self:startReadReport(true)
-            self:showTransientInfo(T(_("Reading time report started: %1"), self._auto_report_book_title), 2)
-        else
-            self:showTransientInfo(_("Current book is not from WeRead, reading time not reported"), 1)
-        end
-    else
-        self:maybeStartReadReport()
+    if rr.enabled and rr.mode == "auto" and reason == "document_not_weread" then
+        self:showTransientInfo(_("Current book is not from WeRead, reading time not reported"), 1)
     end
 end
 
@@ -2926,149 +2936,23 @@ function WeReadPlugin:onCloseDocument()
     self._reader_session_gen = (self._reader_session_gen or 0) + 1
     self:_teardownThoughtInterception()
 
-    local rr = self.settings:get("read_report")
-    if rr.mode == "auto" then
-        self._auto_report_book_id = nil
-        self._auto_report_book_title = nil
-        self:stopReadReport()
-    elseif rr.report_on_open then
-        self:stopReadReport()
-    end
+    self.read_report:on_close_document()
 end
 
 function WeReadPlugin:maybeStartReadReport()
-    local rr = self.settings:get("read_report")
-    if not rr.enabled then
-        return
-    end
-    if rr.mode == "auto" then
-        if not self._auto_report_book_id then
-            return
-        end
-    elseif rr.book_id == "" then
-        return
-    end
-    if rr.report_on_open and not self.ui.document then
-        return
-    end
-    if not self._report_task then
-        self:startReadReport(not rr.report_on_open)
-    end
+    return self.read_report:maybe_start("menu")
 end
 
-function WeReadPlugin:startReadReport(silent)
-    self:stopReadReport()
-    local rr = self.settings:get("read_report")
-    local interval = rr.interval_seconds or 30
-    self._report_count = 0
-    self._report_last_time = nil
-    self._report_last_error = nil
-    self._report_logged_error = nil
-    self._report_task = function()
-        local ok, err = pcall(function()
-            self:doReadReport()
-        end)
-        if not ok then
-            self:setReadReportError(err, "report task error:")
-        end
-        if self._report_task then
-            UIManager:scheduleIn(interval, self._report_task)
-        end
-    end
-    UIManager:scheduleIn(interval, self._report_task)
-    logger.info(LOG_MODULE, "reading time report started")
-    if not silent then
-        self:showTransientInfo(T(_("Reading time report started: %1"), rr.book_title or rr.book_id), 1)
-    end
+function WeReadPlugin:stopReadReport(reason)
+    self.read_report:stop(reason or "explicit_stop")
 end
 
-function WeReadPlugin:stopReadReport()
-    if self._report_task then
-        UIManager:unschedule(self._report_task)
-        self._report_task = nil
-        logger.info(LOG_MODULE, "reading time report stopped, success_count:", self._report_count or 0)
-    end
+function WeReadPlugin:onSuspend()
+    self.read_report:on_suspend()
 end
 
-function WeReadPlugin:setReadReportError(err, log_prefix, update_status)
-    local message = tostring(err)
-    if update_status ~= false then
-        self._report_last_error = message
-    end
-    if self._report_logged_error ~= message then
-        logger.warn(LOG_MODULE, log_prefix or "read report error:", log_error(message))
-        self._report_logged_error = message
-    end
-end
-
-function WeReadPlugin:recordReadReportSuccess()
-    local recovered = self._report_last_error ~= nil
-    self._report_count = (self._report_count or 0) + 1
-    self._report_last_time = os.time()
-    self._report_last_error = nil
-    self._report_logged_error = nil
-    if recovered or self._report_count == 1 or self._report_count % 20 == 0 then
-        logger.info(LOG_MODULE, "read report success, count:", self._report_count)
-    end
-end
-
-function WeReadPlugin:doReadReport()
-    local rr = self.settings:get("read_report")
-    local report_book_id = rr.mode == "auto" and self._auto_report_book_id or rr.book_id
-    if not rr.enabled or not report_book_id or report_book_id == "" then
-        return
-    end
-    if not self.settings:is_cookie_configured() then
-        self:setReadReportError("cookie not configured", "read report skipped:", false)
-        return
-    end
-    local now = os.time()
-    local ts = now * 1000 + math.random(0, 999)
-    local rn = math.random(0, 999)
-    local token = WeRead.DEFAULT_READER_TOKEN
-    local payload = {
-        appId = WeRead.web_app_id(),
-        b = WeRead.e(report_book_id),
-        c = WeRead.e(0),
-        ci = 27,
-        co = 389,
-        sm = "",
-        pr = 74,
-        rt = rr.interval_seconds or 30,
-        ts = ts,
-        rn = rn,
-        sg = Crypto.sha256_hex(tostring(ts) .. tostring(rn) .. token),
-        ct = now,
-        ps = WeRead.e(now - 1),
-        pc = WeRead.e(now),
-    }
-    payload.s = WeRead.sign(WeRead.sorted_query(payload))
-    local ok, result = pcall(function()
-        return self.client:report_read(payload)
-    end)
-    if ok and WeRead.is_success_response(result) then
-        self:recordReadReportSuccess()
-        return
-    end
-    if ok and not WeRead.is_success_response(result) then
-        local renew_ok = pcall(function()
-            self.client:renew_cookie()
-        end)
-        if renew_ok then
-            local ok2, result2 = pcall(function()
-                return self.client:report_read(payload)
-            end)
-            if ok2 and WeRead.is_success_response(result2) then
-                self:recordReadReportSuccess()
-                return
-            end
-        end
-        self:setReadReportError(_("Cookie expired"))
-        return
-    end
-    if not ok then
-        self:setReadReportError(result)
-    end
+function WeReadPlugin:onResume()
+    self.read_report:on_resume()
 end
 
 function WeReadPlugin:onFlushSettings()

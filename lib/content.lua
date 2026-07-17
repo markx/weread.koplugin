@@ -1,4 +1,5 @@
 local Crypto = require("lib.crypto")
+local ReaderState = require("lib.reader_state")
 local WeRead = require("lib.weread")
 local Thoughts = require("lib.thoughts")
 local bit = require("bit")
@@ -350,15 +351,8 @@ function Content.decode_content_shard(e0)
     return decode_encoded_body(checked_body(e0))
 end
 
-function Content.extract_reader_state(html)
-    return {
-        book_id = html:match([["bookId"%s*:%s*"([^"]+)"]]) or html:match([["bookId"%s*:%s*(%d+)]]),
-        title = html:match([["title"%s*:%s*"([^"]+)"]]),
-        author = html:match([["author"%s*:%s*"([^"]+)"]]),
-        psvts = html:match([["psvts"%s*:%s*"([^"]+)"]]),
-        pclts = html:match([["pclts"%s*:%s*"([^"]+)"]]),
-        token = html:match([["token"%s*:%s*"([^"]+)"]]),
-    }
+function Content.extract_reader_state(html, json_decode)
+    return ReaderState.extract(html, json_decode)
 end
 
 function Content.normalize_chapters(payload, book_id)
@@ -779,14 +773,20 @@ function Content.ensure_reader_state(client, book)
     local book_id = book.book_id or book.bookId
     local reader_url = book.reader_url or WeRead.reader_url(book_id)
     local reader_html = client:get_text(reader_url, { referer = reader_url })
-    local state = Content.extract_reader_state(reader_html)
+    local state = Content.extract_reader_state(reader_html, function(encoded)
+        return client:json_decode(encoded)
+    end)
     book.book_id = book.book_id or state.book_id or book.bookId
     book.title = book.title or state.title
     book.author = book.author or state.author
-    book.psvts = state.psvts or book.psvts
-    book.pclts = state.pclts or book.pclts
-    book.token = state.token or book.token
+    -- These values belong to one Web Reader session. Never retain a cached
+    -- value when the freshly opened reader omits it (notably pclts).
+    book.psvts = state.psvts
+    book.pclts = state.pclts
+    book.token = state.token
     book.reader_url = reader_url
+
+    ReaderState.apply_to_book(book, state)
 
     if not book.psvts then
         error("reader.psvts not found")
