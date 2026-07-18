@@ -19,12 +19,13 @@ lib/book_store.lua      Per-book metadata, reading-state, and article-list persi
 lib/content.lua         Content decoding (e_0/e_1/e_2/e_3), EPUB/HTML generation
 lib/cookie.lua          Cookie header parsing and merging
 lib/crypto.lua          SHA-256, MD5 (pure Lua)
-lib/download_dialog.lua Custom download progress dialog with cancel button
+lib/downloader.lua      Book/chapter download engine (state machine + standby guard)
 lib/i18n.lua            Chinese translations (zh table, _() wrapper)
 lib/read_report.lua     Reading-report state machine, context refresh, retries
 lib/reader_state.lua    Web Reader session and position extraction
 lib/settings.lua        Settings persistence via KOReader LuaSettings
 lib/weread.lua          WeRead protocol utilities (encoding, signing, URL helpers)
+ui/download_dialog.lua  Custom download progress dialog with cancel button
 ```
 
 ## Key Conventions
