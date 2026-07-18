@@ -17,6 +17,7 @@ local T = require("ffi/util").template
 
 local Client = require("lib.client")
 local Content = require("lib.content")
+local EndOfBookDialog = require("ui.end_of_book_dialog")
 local I18n = require("lib.i18n")
 local QRLogin = require("lib.qr_login")
 local ReadReport = require("lib.read_report")
@@ -2000,11 +2001,7 @@ function WeReadPlugin:showChapterList(book)
                 text = chapter.title or T(_("Chapter %1"), tostring(chapter.chapterUid)),
                 post_text = cached and _("Cached") or T(_("%1 words"), tostring(chapter.wordCount or 0)),
                 callback = self:safeCallback(chapter.title or _("Chapter"), function()
-                    if cached then
-                        self:openFile(cached)
-                    else
-                        self:downloadChapterAndRead(book, chapter)
-                    end
+                    self:openChapter(book, chapter)
                 end),
             })
         end
@@ -2029,6 +2026,16 @@ end
 
 function WeReadPlugin:openCachedBook(book)
     self:openFile(book.cached_file)
+end
+
+-- Open a chapter, preferring its cached file and falling back to a download.
+function WeReadPlugin:openChapter(book, chapter)
+    local cached = book.cached_chapters and book.cached_chapters[tostring(chapter.chapterUid)]
+    if cached then
+        self:openFile(cached)
+    else
+        self:downloadChapterAndRead(book, chapter)
+    end
 end
 
 function WeReadPlugin:downloadFirstChapterAndRead(book)
@@ -2744,6 +2751,7 @@ function WeReadPlugin:applyAnnotationVisibility()
         logger.warn(LOG_MODULE, "applyAnnotationVisibility failed:", err)
     end
 end
+
 function WeReadPlugin:_teardownThoughtInterception()
     if self._thought_interception_setup and self.ui then
         self.ui:unRegisterTouchZones({
@@ -2989,8 +2997,14 @@ function WeReadPlugin:_onThoughtTap(ges)
     return true
 end
 
-function WeReadPlugin:myOnEndOfBook(status_self)
-    local settings = G_reader_settings and G_reader_settings:readSetting("end_document_action") or "pop-up"
+-- Intercepts ReaderStatus:onEndOfBook for WeRead books (installed as a hook in
+-- onReaderReady). Non-WeRead books defer to the original handler. For WeRead
+-- books, an end_document_action of "next_file" auto-advances to the next
+-- chapter; every other action (pop-up, book_status, …) shows our own navigation
+-- dialog instead of the native one, falling back to the native handler only
+-- when the dialog cannot be built.
+function WeReadPlugin:handleEndOfBook(status_self)
+    local action = G_reader_settings and G_reader_settings:readSetting("end_document_action") or "pop-up"
     local book_id = self:detectWeReadBook()
     if not book_id then
         return self._orig_onEndOfBook(status_self)
@@ -2998,27 +3012,26 @@ function WeReadPlugin:myOnEndOfBook(status_self)
 
     local books = self.settings:get("books", {})
     local book = books[book_id]
+    self:ensureChaptersLoaded(book)
     local file = self.ui.document and self.ui.document.file
     local current_idx, current_ch, is_full_book = self:getChapterInfoFromFile(book, file)
     local next_ch = (not is_full_book) and current_idx and book.chapters[current_idx + 1]
 
-    if settings == "next_file" then
+    if action == "next_file" then
         if next_ch then
-            local InfoMessage = require("ui/widget/infomessage")
-            local info = InfoMessage:new{ text = _("Opening next chapter…") }
-            UIManager:show(info)
-            UIManager:forceRePaint()
-            UIManager:close(info)
-            self:downloadChapterAndRead(book, next_ch)
+            self:openChapter(book, next_ch)
         else
             self:showInfo(_("You have reached the last chapter."))
         end
         return true
-    elseif settings == "pop-up" then
-        -- For "pop-up" action, show our beautifully pure WeRead dialog instead of native dialog
-        if self:showEndOfBookDialog(book_id) then
-            return true
-        end
+    end
+
+    -- For every other end-of-document action, prefer our WeRead navigation
+    -- dialog. This intentionally overrides the global end_document_action
+    -- (pop-up, book_status, …) for WeRead books; fall back to the native
+    -- handler only when the dialog cannot be built.
+    if self:showEndOfBookDialog(book_id) then
+        return true
     end
 
     return self._orig_onEndOfBook(status_self)
@@ -3059,7 +3072,7 @@ function WeReadPlugin:onReaderReady()
         if not self._orig_onEndOfBook and self.ui.status and type(self.ui.status.onEndOfBook) == "function" then
             self._orig_onEndOfBook = self.ui.status.onEndOfBook
             self.ui.status.onEndOfBook = function(status_self)
-                return self:myOnEndOfBook(status_self)
+                return self:handleEndOfBook(status_self)
             end
         end
     else
@@ -3113,76 +3126,61 @@ function WeReadPlugin:showEndOfBookDialog(book_id)
 
     local books = self.settings:get("books", {})
     local book = books[book_id]
-    if not book or not book.chapters then return false end
+    if not book or not self:ensureChaptersLoaded(book) then return false end
 
     local current_idx, current_ch, is_full_book = self:getChapterInfoFromFile(book, file_path)
-    local next_chapter = (not is_full_book) and current_idx and book.chapters[current_idx + 1]
+    -- The chapter-nav row is shown only for single downloaded chapters (a mapped
+    -- current chapter that is not part of a full-book EPUB); "next chapter"
+    -- additionally requires a successor.
+    local show_chapter_nav = current_idx ~= nil and not is_full_book
+    local next_chapter = show_chapter_nav and book.chapters[current_idx + 1] or nil
 
-    local ButtonDialog = require("ui/widget/buttondialog")
-    local buttons = {}
-    local dialog
-
-    -- Navigation buttons (Chapter list and Bookshelf)
-    local row1 = {
-        {
-            text = _("WeRead: Bookshelf"),
-            callback = function()
-                UIManager:close(dialog)
-                UIManager:scheduleIn(0.1, function()
-                    self:showBookshelf()
-                end)
+    EndOfBookDialog.show({ show_chapter_nav = show_chapter_nav, has_next = next_chapter ~= nil }, {
+        on_bookshelf = function()
+            self:showBookshelf()
+        end,
+        on_search = function()
+            self:showSearch()
+        end,
+        on_chapter_list = function()
+            self:showChapterList(book)
+        end,
+        on_next = next_chapter and function()
+            self:openChapter(book, next_chapter)
+        end or nil,
+        on_book_details = function()
+            self:showCurrentBookDetails()
+        end,
+        on_read_stats = function()
+            self:showReadStats()
+        end,
+        on_close_book = function()
+            -- Mirror KOReader's ReaderStatus:openFileBrowser(): closing the
+            -- reader alone exits the app when there is no file-manager stack, so
+            -- reopen the file browser right after (positioned on the book file).
+            local ui = self.ui
+            if not ui then return end
+            local file = ui.document and ui.document.file
+            ui:onClose()
+            if file and ui.showFileManager then
+                ui:showFileManager(file)
             end
-        },
-        {
-            text = _("WeRead: Chapter list"),
-            callback = function()
-                UIManager:close(dialog)
-                UIManager:scheduleIn(0.1, function()
-                    self:showChapterList(book)
-                end)
-            end
-        }
-    }
-    table.insert(buttons, row1)
-
-    -- Next Chapter button (only if it's a single chapter file and there is a next chapter)
-    if next_chapter then
-        local row2 = {
-            {
-                text = _("WeRead: Next chapter"),
-                callback = function()
-                    UIManager:close(dialog)
-                    UIManager:scheduleIn(0.1, function()
-                        local cached = book.cached_chapters and book.cached_chapters[tostring(next_chapter.chapterUid)]
-                        if cached then
-                            self:openFile(cached)
-                        else
-                            self:downloadChapterAndRead(book, next_chapter)
-                        end
-                    end)
-                end
-            }
-        }
-        table.insert(buttons, row2)
-    end
-
-    -- Cancel button in a separate row
-    table.insert(buttons, {
-        {
-            text = _("Cancel"),
-            callback = function()
-                UIManager:close(dialog)
-            end
-        }
+        end,
     })
-
-    dialog = ButtonDialog:new{
-        title = _("WeRead: Reached end of chapter"),
-        buttons = buttons,
-    }
-
-    UIManager:show(dialog)
     return true
+end
+
+-- Ensure the book's chapter catalog is available in memory. Since chapter lists
+-- are no longer persisted with the book record (they live in a separate on-disk
+-- catalog cache), a book loaded from settings usually has book.chapters == nil;
+-- this loads it from the cache. Synchronous, no network. Returns the chapter
+-- list, or nil if the cache is missing (e.g. the book was never opened/cached).
+function WeReadPlugin:ensureChaptersLoaded(book)
+    if not book then return nil end
+    if not (type(book.chapters) == "table" and #book.chapters > 0) then
+        Content.load_catalog_cache(self.client, self.settings, book)
+    end
+    return book.chapters
 end
 
 -- Retrieves chapter information for the given file path.
