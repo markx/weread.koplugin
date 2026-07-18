@@ -648,6 +648,19 @@ function M.closeVisible()
     end
 end
 
+-- Whether a thought popup is actually on screen right now. The pooled widget is
+-- kept for reuse after closing, so identity alone is not enough; ask UIManager
+-- whether it is still in the window stack.
+function M.isShowing()
+    if not _pooled_popup then
+        return false
+    end
+    local ok, shown = pcall(function()
+        return UIManager:isWidgetShown(_pooled_popup)
+    end)
+    return ok and shown == true
+end
+
 function M.getPoolStats()
     local has_active = _pooled_popup ~= nil
     return { pool_size = has_active and 1 or 0, max_size = 1, has_active = has_active }

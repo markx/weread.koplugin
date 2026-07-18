@@ -59,6 +59,35 @@ function Thoughts.save_cache(settings, book_id, chapter_uid, reviews)
     return true
 end
 
+--- 读取某章缓存的想法数据（save_cache 的对称读取端）。
+-- 点击划线时由 main.lua 调用，按 range 匹配后渲染弹窗。
+-- @return table|nil  原始 reviews 数组（每元素含 .range / .pageReviews），失败返回 nil
+function Thoughts.load_cache(settings, book_id, chapter_uid)
+    local path = Thoughts.cache_path(settings, book_id, chapter_uid)
+    local file = io.open(path, "r")
+    if not file then
+        return nil
+    end
+    local data = file:read("*a") or ""
+    file:close()
+    if data == "" then
+        return nil
+    end
+    -- Prefer rapidjson (C parser) — much faster than the pure-Lua json module,
+    -- which matters for chapters with many thoughts (large JSON) on slow devices.
+    local ok, decoded = pcall(function()
+        local json = require("rapidjson")
+        return json.decode and json.decode(data) or json:decode(data)
+    end)
+    if not ok or type(decoded) ~= "table" then
+        ok, decoded = pcall(require("json").decode, data)
+    end
+    if not ok or type(decoded) ~= "table" then
+        return nil
+    end
+    return decoded
+end
+
 function Thoughts.collect_ranges(underlines_data)
     local ranges = {}
     if type(underlines_data) ~= "table" then
@@ -103,7 +132,7 @@ function Thoughts.apply_data(settings, book_id, chapter_uid, xhtml, underlines_d
         Thoughts.save_cache(settings, book_id, chapter_uid, reviews)
     end
     underlines_data.chapterUid = chapter_uid
-    local processed, annotation_css = Annotations.process(xhtml, underlines_data, reviews)
+    local processed, annotation_css = Annotations.process(xhtml, underlines_data, reviews, book_id)
     if processed ~= xhtml then
         log_info("injected underlines for chapter:", chapter_uid)
     end

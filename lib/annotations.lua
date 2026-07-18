@@ -21,7 +21,6 @@ Annotations.UNDERLINE_CSS = [[
 Annotations.THOUGHT_CSS = [[
 .wr-thought-link{text-decoration:none;color:inherit;}
 .wr-star{font-size:0.6em;vertical-align:super;line-height:0;color:#aaa;margin-left:1px;}
-.weread-thought{display:none;}
 ]]
 
 --- 去除字符串开头的 UTF-8 BOM（\ufeff）。
@@ -235,58 +234,67 @@ local function htmlEscape(text)
     return text
 end
 
---- 构建想法内容 aside 块（EPUB 标准脚注）。
--- @return string  aside HTML
-function Annotations.buildThoughtAsides(thought_reviews, chapter_uid)
-    if type(thought_reviews) ~= "table" then return "" end
-    if not chapter_uid then return "" end
+--- 把 range 想法数据里的非安全字符替换为下划线，用于内部锚点 id。
+local function idSafe(text)
+    return tostring(text or ""):gsub("[^%w%._%-]", "_")
+end
 
-    local parts = { '<section epub:type="footnotes">' }
+--- 生成想法内部锚点 id：wrthought-<book>-<chap>-<start>-<end>。
+-- range_str 形如 "383-415"，其中 - 是 start/end 分隔符。
+local function thoughtAnchorId(book_id, chapter_uid, range_str)
+    return "wrthought-" .. idSafe(book_id) .. "-" .. idSafe(chapter_uid) .. "-" .. tostring(range_str or "")
+end
 
-    for _, rv in ipairs(thought_reviews) do
-        if rv.pageReviews and #rv.pageReviews > 0 then
-            local range_str = rv.range or "0-0"
-            local id = "thought_" .. tostring(chapter_uid) .. "_" .. range_str:gsub("-", "_")
-            parts[#parts + 1] = '<aside epub:type="footnote" id="' .. id .. '" class="footnote weread-thought">'
+Annotations.thoughtAnchorId = thoughtAnchorId
 
-            -- 引用原文（截断）
-            local abstract = nil
-            local first_pr = rv.pageReviews[1]
-            if first_pr and first_pr.review then
-                abstract = first_pr.review.abstract or first_pr.review.contextAbstract
-            end
-
-            for i, pr in ipairs(rv.pageReviews) do
-                local review = pr.review or {}
-                local author = review.author or {}
-                local name = author.nick or author.name or "匿名"
-                local content = review.content or ""
-                local likes = pr.likesCount or 0
-
-                parts[#parts + 1] = '<p style="white-space:pre-line">'
-
-                -- 第一条想法附带引用原文
-                if i == 1 and abstract then
-                    local q = truncateRunes(abstract, 50)
-                    parts[#parts + 1] = '<span style="color:#666;font-style:italic">「' ..
-                    htmlEscape(q) .. '」</span><br/>'
-                end
-
-                -- 作者 + 点赞
-                local meta = "▸ " .. htmlEscape(name)
-                if likes > 0 then meta = meta .. " · ♥ " .. likes end
-                parts[#parts + 1] = '<span style="color:#999;font-size:0.85em">' .. meta .. '</span><br/>'
-
-                -- 正文
-                parts[#parts + 1] = '<span>' .. htmlEscape(content) .. '</span>'
-                parts[#parts + 1] = '</p>'
-            end
-
-            parts[#parts + 1] = '</aside>'
-        end
+--- 把单条 range 想法渲染成弹窗用 HTML 片段。
+-- 点击划线时由 main.lua 从每章 thoughts/<uid>.json 现取 range_review 并调用此函数。
+-- 想法不再写入 EPUB（不生成 <aside> 脚注），因此这里用普通 <div>，纯内联样式，
+-- 与 ui/thought_popup.lua 的默认 CSS 无耦合。
+-- @table range_review  单条 range 的想法数据（含 .pageReviews）
+-- @return string|nil  HTML 片段
+function Annotations.buildThoughtPopupHtml(range_review)
+    if type(range_review) ~= "table" or type(range_review.pageReviews) ~= "table"
+        or #range_review.pageReviews == 0 then
+        return nil
     end
 
-    parts[#parts + 1] = '</section>'
+    local parts = { '<div class="weread-thought">' }
+
+    -- 引用原文（截断）
+    local abstract = nil
+    local first_pr = range_review.pageReviews[1]
+    if first_pr and first_pr.review then
+        abstract = first_pr.review.abstract or first_pr.review.contextAbstract
+    end
+
+    for i, pr in ipairs(range_review.pageReviews) do
+        local review = pr.review or {}
+        local author = review.author or {}
+        local name = author.nick or author.name or "匿名"
+        local content = review.content or ""
+        local likes = pr.likesCount or 0
+
+        parts[#parts + 1] = '<p style="white-space:pre-line">'
+
+        -- 第一条想法附带引用原文
+        if i == 1 and abstract then
+            local q = truncateRunes(abstract, 50)
+            parts[#parts + 1] = '<span style="color:#666;font-style:italic">「' ..
+            htmlEscape(q) .. '」</span><br/>'
+        end
+
+        -- 作者 + 点赞
+        local meta = "▸ " .. htmlEscape(name)
+        if likes > 0 then meta = meta .. " · ♥ " .. likes end
+        parts[#parts + 1] = '<span style="color:#999;font-size:0.85em">' .. meta .. '</span><br/>'
+
+        -- 正文
+        parts[#parts + 1] = '<span>' .. htmlEscape(content) .. '</span>'
+        parts[#parts + 1] = '</p>'
+    end
+
+    parts[#parts + 1] = '</div>'
     return table.concat(parts, "\n")
 end
 
@@ -295,7 +303,7 @@ end
 -- @table  underlines  划线列表
 -- @table  thought_reviews  想法数据 map
 -- @return processed_html
-function Annotations.injectUnderlines(html, underlines, thought_reviews, chapter_uid)
+function Annotations.injectUnderlines(html, underlines, thought_reviews, chapter_uid, book_id)
     if type(html) ~= "string" or html == "" then
         return html
     end
@@ -382,15 +390,24 @@ function Annotations.injectUnderlines(html, underlines, thought_reviews, chapter
                 wrapped[last_idx] = underline_close_with_ref
             end
 
-            local href = "#thought_" .. tostring(chapter_uid) .. "_" .. ul.range_str:gsub("-", "_")
-            local open_a = '<a epub:type="noteref" class="wr-thought-link" href="' .. href .. '">'
+            -- 内部锚点（非 noteref）：去掉 epub:type="noteref" 避免 crengine 走专用
+            -- 脚注弹窗路径（该路径无视 CSS pointer-events）。想法内容不再内嵌 EPUB，
+            -- 点击时由 main.lua 从缓存 JSON 现取。锚点已编码 book_id+chapter_uid+range。
+            local anchor_id = thoughtAnchorId(book_id, chapter_uid, ul.range_str)
+            local href = "#" .. anchor_id
+            local open_a = '<a class="wr-thought-link" href="' .. htmlEscape(href) .. '">'
+            -- 只第一个 <a> 带 id：拦截失败时 KOReader 跟随锚点最多跳回划线起点（兜底）。
+            local open_a_with_id = '<a id="' .. htmlEscape(anchor_id)
+                .. '" class="wr-thought-link" href="' .. htmlEscape(href) .. '">'
 
             -- wrapTextSegments 为每个文本段生成独立的 underline span；
             -- 逐 span 包裹 <a> 可避免 </h1><p>、</p><p> 等块级边界导致 MuPDF 截断链接。
             local with_links = {}
+            local first_link = true
             for _, item in ipairs(wrapped) do
                 if item == underline_open then
-                    with_links[#with_links + 1] = open_a
+                    with_links[#with_links + 1] = first_link and open_a_with_id or open_a
+                    first_link = false
                     with_links[#with_links + 1] = item
                 elseif item == underline_close or item == underline_close_with_ref then
                     with_links[#with_links + 1] = item
@@ -445,7 +462,7 @@ end
 -- @table  chapter_underlines  章节划线数据（来自 API）
 -- @table  thought_reviews  想法数据 map（可选），keyed by range string
 -- @return processed_html, css  处理后的 HTML 和额外的 CSS
-function Annotations.process(html, chapter_underlines, thought_reviews)
+function Annotations.process(html, chapter_underlines, thought_reviews, book_id)
     if type(html) ~= "string" or html == "" then
         return html, ""
     end
@@ -476,23 +493,10 @@ function Annotations.process(html, chapter_underlines, thought_reviews)
     logger.info("weread annotations: processing", #underlines, "underlines",
         thought_map and ("thoughts on " .. #underlines) or "")
 
-    local processed = Annotations.injectUnderlines(html, underlines, thought_map, chapter_underlines.chapterUid)
+    local processed = Annotations.injectUnderlines(html, underlines, thought_map,
+        chapter_underlines.chapterUid, book_id)
 
-    -- 构建想法 aside 块并注入到 body 末尾
-    if thought_map and processed ~= html then
-        local chapter_uid = chapter_underlines.chapterUid
-        if chapter_uid and thought_reviews then
-            local aside_html = Annotations.buildThoughtAsides(thought_reviews, chapter_uid)
-            if aside_html ~= "" then
-                local last_body = processed:find("</body>", 1, true)
-                if last_body then
-                    processed = processed:sub(1, last_body - 1) .. aside_html .. processed:sub(last_body)
-                else
-                    processed = processed .. aside_html
-                end
-            end
-        end
-    end
+    -- 想法内容不再注入 EPUB（不生成 <aside> 脚注），改为点击时从缓存 JSON 现取。
 
     if processed ~= html then
         local css = Annotations.UNDERLINE_CSS

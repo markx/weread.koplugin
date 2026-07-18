@@ -14,6 +14,7 @@ local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local T = require("ffi/util").template
 
+local Annotations = require("lib.annotations")
 local Client = require("lib.client")
 local Content = require("lib.content")
 local Downloader = require("lib.downloader")
@@ -25,6 +26,7 @@ local ReadReport = require("lib.read_report")
 local ReadStats = require("lib.read_stats")
 local ReadStatsView = require("ui.read_stats_view")
 local Settings = require("lib.settings")
+local Thoughts = require("lib.thoughts")
 local WeRead = require("lib.weread")
 local ThoughtPopup = require("ui.thought_popup")
 
@@ -35,6 +37,11 @@ end
 
 local LOG_MODULE = "[WeRead]"
 local unpack_args = unpack or table.unpack
+
+-- Hard ceilings for the per-session thought caches (both cleared on book close).
+-- On overflow the whole map is dropped; the next tap simply re-renders / re-reads.
+local THOUGHT_HTML_CACHE_MAX = 300  -- distinct tapped underlines
+local THOUGHT_JSON_CACHE_MAX = 10   -- distinct chapters with thoughts
 
 local function thought_perf(stage, started, ...)
     local elapsed = tonumber(time.now() - started) / 1000
@@ -2412,7 +2419,8 @@ end
 -- use display/white-space here — changing those marks the built DOM stale and
 -- makes ReaderRolling repeatedly prompt for a full document reload.
 local ANNOTATION_HIDE_CSS =
-    ".wr-underline{border-bottom:0 !important;padding-bottom:0 !important;} .wr-star{font-size:0 !important;}"
+    ".wr-underline{border-bottom:0 !important;padding-bottom:0 !important;} .wr-star{font-size:0 !important;} "
+    .. ".wr-thought-link{pointer-events:none !important;text-decoration:none !important;color:inherit !important;}"
 
 -- Apply the initial hidden state before KOReader renders the document. Doing
 -- this from onReaderReady starts partial rerendering; its seamless reload then
@@ -2475,6 +2483,38 @@ function WeReadPlugin:applyAnnotationVisibility()
     end
 end
 
+-- Hide our thought anchors from KOReader's link hit-testing while annotations
+-- are hidden. crengine ignores CSS pointer-events for link detection, so without
+-- this a tap on a hidden underline is swallowed by ReaderLink (it follows the
+-- #wrthought anchor, a same-page jump) instead of turning the page. Returning nil
+-- makes ReaderLink's tap_link handler find no link and decline, so the tap falls
+-- through to KOReader's native page-turn (honoring the user's tap zones / RTL).
+-- Only our own anchors are hidden, and only while annotations are off.
+function WeReadPlugin:_installLinkFilter()
+    if not self.ui or not self.ui.link or self._orig_getLinkFromGes then
+        return
+    end
+    self._orig_getLinkFromGes = self.ui.link.getLinkFromGes
+    local plugin = self
+    self.ui.link.getLinkFromGes = function(link_self, ges)
+        local link = plugin._orig_getLinkFromGes(link_self, ges)
+        if link and plugin.settings:get("cache").show_annotations == false then
+            local href = plugin:_linkHref(link)
+            if type(href) == "string" and href:find("wrthought%-") then
+                return nil
+            end
+        end
+        return link
+    end
+end
+
+function WeReadPlugin:_removeLinkFilter()
+    if self._orig_getLinkFromGes and self.ui and self.ui.link then
+        self.ui.link.getLinkFromGes = self._orig_getLinkFromGes
+    end
+    self._orig_getLinkFromGes = nil
+end
+
 function WeReadPlugin:_teardownThoughtInterception()
     if self._thought_interception_setup and self.ui then
         self.ui:unRegisterTouchZones({
@@ -2482,12 +2522,17 @@ function WeReadPlugin:_teardownThoughtInterception()
         })
         self._thought_interception_setup = nil
     end
+    self:_removeLinkFilter()
     ThoughtPopup.closeVisible()
     ThoughtPopup.cancelPrewarm()
     self._thought_popup_open = nil
     self._current_thought_popup = nil
     self._thought_html_cache = nil
+    self._thought_html_cache_n = nil
+    self._thought_json_cache = nil
+    self._thought_json_cache_n = nil
     self._thought_highlight_active = nil
+    self._current_weread_book_id = nil
 end
 
 function WeReadPlugin:_setupThoughtInterception()
@@ -2510,6 +2555,7 @@ function WeReadPlugin:_setupThoughtInterception()
             end,
         },
     })
+    self:_installLinkFilter()
     self._thought_interception_setup = true
 end
 
@@ -2645,62 +2691,202 @@ function WeReadPlugin:_showThoughtPopup(html, link, session_gen, tap_started)
     end
 end
 
+-- Recursively pull a thought anchor href out of a KOReader link object.
+-- The link's shape differs between engines and even between tap locations inside
+-- the same anchor (tapping the star vs the underlined text can expose the href
+-- under a different field), so scan common fields first, then a shallow crawl.
+function WeReadPlugin:_linkHref(link)
+    local seen = {}
+    local function extract(value, depth)
+        if depth > 4 or value == nil then
+            return nil
+        end
+        if type(value) == "string" then
+            return value:match("(#wrthought%-[%w%._%-]+)")
+                or value:match("(wrthought%-[%w%._%-]+)")
+        end
+        if type(value) ~= "table" or seen[value] then
+            return nil
+        end
+        seen[value] = true
+        for _, key in ipairs({ "href", "url", "target", "link", "uri", "dest", "destination", "src" }) do
+            local found = extract(value[key], depth + 1)
+            if found then
+                return found
+            end
+        end
+        for _, child in pairs(value) do
+            local found = extract(child, depth + 1)
+            if found then
+                return found
+            end
+        end
+        return nil
+    end
+    return extract(link, 0)
+end
+
+-- Parse "#wrthought-<book>-<chapter>-<start>-<end>" into its parts. The last two
+-- segments are numeric (range start/end); book/chapter must not contain dashes
+-- (true for WeRead IDs in practice).
+function WeReadPlugin:_parseThoughtHref(href)
+    if type(href) ~= "string" then
+        return nil
+    end
+    local anchor = href:match("#?(wrthought%-[%w%._%-]+)")
+    if not anchor then
+        return nil
+    end
+    local book_id, chapter_uid, start_pos, end_pos =
+        anchor:match("^wrthought%-([^%-]+)%-([^%-]+)%-(%d+)%-(%d+)$")
+    if not (book_id and chapter_uid and start_pos and end_pos) then
+        logger.warn(LOG_MODULE, "unparseable thought anchor:", anchor)
+        return nil
+    end
+    return {
+        book_id = book_id,
+        chapter_uid = chapter_uid,
+        range = start_pos .. "-" .. end_pos,
+    }
+end
+
+-- Load a chapter's cached thoughts, memoized per (book, chapter) so tapping
+-- different underlines in the same chapter reads/decodes the JSON only once.
+-- Returns the decoded reviews array, or false if the chapter has no cache.
+function WeReadPlugin:_loadThoughtReviews(book_id, chapter_uid)
+    self._thought_json_cache = self._thought_json_cache or {}
+    local key = tostring(book_id) .. ":" .. tostring(chapter_uid)
+    local cached = self._thought_json_cache[key]
+    if cached ~= nil then
+        return cached
+    end
+    local reviews = Thoughts.load_cache(self.settings, book_id, chapter_uid)
+    if type(reviews) ~= "table" then
+        reviews = false
+    end
+    self._thought_json_cache_n = (self._thought_json_cache_n or 0) + 1
+    if self._thought_json_cache_n > THOUGHT_JSON_CACHE_MAX then
+        self._thought_json_cache = {}
+        self._thought_json_cache_n = 1
+    end
+    self._thought_json_cache[key] = reviews
+    return reviews
+end
+
+-- Whether this href's chapter thoughts are already decoded in memory. Used to
+-- decide if the first-tap loading message is needed (skipped once cached).
+function WeReadPlugin:_isChapterThoughtsCached(href)
+    local info = self:_parseThoughtHref(href)
+    if not info or not self._thought_json_cache then
+        return false
+    end
+    return self._thought_json_cache[tostring(info.book_id) .. ":" .. tostring(info.chapter_uid)] ~= nil
+end
+
+-- Load the chapter's cached thoughts, match the tapped range, render popup HTML.
+function WeReadPlugin:_buildThoughtHtmlFromHref(href)
+    local info = self:_parseThoughtHref(href)
+    if not info then
+        return nil
+    end
+    local reviews = self:_loadThoughtReviews(info.book_id, info.chapter_uid)
+    if type(reviews) ~= "table" then
+        -- Cache missing/unreadable (e.g. user deleted thoughts/<uid>.json).
+        self:showInfo(_("No cached thoughts found for this chapter. Please re-download the book with underlines and thoughts."))
+        return nil
+    end
+    for _i, rv in ipairs(reviews) do
+        if tostring(rv.range or "") == info.range then
+            local html = Annotations.buildThoughtPopupHtml(rv)
+            if type(html) == "string" and html ~= "" then
+                return html
+            end
+            break
+        end
+    end
+    -- Recognized underline but no renderable thought (range not in cache, or empty).
+    self:showInfo(_("No matching thought found for this underline."))
+    return nil
+end
+
 function WeReadPlugin:_onThoughtTap(ges)
     local tap_started = time.now()
     if not self.ui or not self.ui.document or not self.ui.link then
         return false
     end
-    if not self:detectWeReadBook() then
+    -- The tap zone is only registered for WeRead books, so a cached flag is
+    -- enough here; avoid re-scanning the book table on every tap.
+    if not self._current_weread_book_id then
         return false
     end
 
     local link_started = time.now()
-    local link = self.ui.link:getLinkFromGes(ges)
-    thought_perf("link_lookup", link_started, "found=", tostring(link ~= nil))
-    if not link or not link.xpointer then
+    local ok, link = pcall(function()
+        return self.ui.link:getLinkFromGes(ges)
+    end)
+    thought_perf("link_lookup", link_started, "found=", tostring(ok and link ~= nil))
+    -- No followable link here (e.g. hidden underline whose link is disabled via
+    -- pointer-events:none) → return false so the tap falls through to KOReader's
+    -- default page-turn, honoring the user's tap-zone / RTL settings.
+    if not ok or not link then
         return false
     end
 
-    local html
-    local cache_hit = false
-    local cache = self._thought_html_cache
-    if cache and cache[link.xpointer] ~= nil then
-        cache_hit = true
-        local cached = cache[link.xpointer]
-        if cached == false then
-            return false
-        end
-        html = cached
-    else
-        local extract_started = time.now()
-        -- The generated EPUB groups all thought asides in one footnotes section.
-        -- Asking CREngine for the "final parent" expands a single target aside
-        -- to that whole section, which mixes unrelated thoughts and makes MuPDF
-        -- lay out hundreds of footnotes. The link target itself is already the
-        -- complete <aside>, so keep extraction scoped to that node.
-        html = self.ui.document:getHTMLFromXPointer(link.xpointer, 0x1001, false)
-        thought_perf("extract_html", extract_started,
-            "html_bytes=", tostring(type(html) == "string" and #html or 0))
-        if type(html) ~= "string" or not html:find("weread%-thought") then
-            self._thought_html_cache = self._thought_html_cache or {}
-            self._thought_html_cache[link.xpointer] = false
-            return false
-        end
-        self._thought_html_cache = self._thought_html_cache or {}
-        self._thought_html_cache[link.xpointer] = html
+    local href = self:_linkHref(link)
+    if type(href) ~= "string" or not href:find("wrthought%-") then
+        -- Some other EPUB link (footnote, TOC, external) → let KOReader handle it.
+        return false
     end
-    thought_perf("tap_resolve", tap_started, "cache_hit=", tostring(cache_hit),
-        "html_bytes=", tostring(#html))
 
-    -- When annotations are hidden, still consume the tap so KOReader's built-in
-    -- footnote popup (triggered by the epub:type="noteref" link) does not fire,
-    -- but do not show our own thought popup either.
+    -- Annotations hidden: _installLinkFilter already made getLinkFromGes return nil
+    -- for our anchors, so we normally return above before reaching here. Kept as a
+    -- defensive fall-through in case the filter is not active.
     if self.settings:get("cache").show_annotations == false then
+        return false
+    end
+
+    -- Cache the rendered HTML by href (stable, page-independent).
+    self._thought_html_cache = self._thought_html_cache or {}
+    local html = self._thought_html_cache[href]
+    if html == nil then
+        -- The first tap in a chapter reads + decodes its thoughts JSON, which can
+        -- take a moment for chapters with many thoughts. Show a brief loading
+        -- message; skipped once the chapter is cached, so it never flashes on
+        -- subsequent (instant) taps.
+        local loading
+        if not self:_isChapterThoughtsCached(href) then
+            loading = InfoMessage:new{ text = _("Loading thoughts…") }
+            UIManager:show(loading)
+            self:refreshUI()  -- force the message to paint before the blocking load
+        end
+        html = self:_buildThoughtHtmlFromHref(href) or false
+        if loading then
+            UIManager:close(loading)
+        end
+        self._thought_html_cache_n = (self._thought_html_cache_n or 0) + 1
+        if self._thought_html_cache_n > THOUGHT_HTML_CACHE_MAX then
+            self._thought_html_cache = {}
+            self._thought_html_cache_n = 1
+        end
+        self._thought_html_cache[href] = html
+    end
+    thought_perf("tap_resolve", tap_started, "cached=", tostring(html ~= nil),
+        "html_bytes=", tostring(type(html) == "string" and #html or 0))
+    if html == false or type(html) ~= "string" then
+        -- Recognized our underline but have no content (already told the user why,
+        -- e.g. deleted cache). Consume the tap so tap_link does not follow the
+        -- now-pointless #wrthought anchor.
         return true
     end
 
+    -- Guard against a stale flag: if we believe a popup is open but it is not
+    -- actually on screen (e.g. it was closed through a path that skipped the
+    -- close callback), reset instead of silently swallowing every tap forever.
     if self._thought_popup_open then
-        return true
+        if ThoughtPopup.isShowing() then
+            return true
+        end
+        self._thought_popup_open = nil
     end
     self._thought_popup_open = true
     local session_gen = self._reader_session_gen or 0
@@ -2765,6 +2951,9 @@ function WeReadPlugin:onReaderReady()
     self:_teardownThoughtInterception()
 
     local weread_book_id = self:detectWeReadBook()
+    -- Cache it so the per-tap handler (_onThoughtTap) does not have to re-scan
+    -- the whole book table on every screen tap.
+    self._current_weread_book_id = weread_book_id
     if weread_book_id then
         -- Always register the tap interception: even when annotations are hidden
         -- we must intercept taps on thought links to suppress the native footnote
