@@ -1612,49 +1612,145 @@ function WeReadPlugin:parseAndShowShelf(all_books)
     end
 end
 
+function WeReadPlugin:_applyShelfData(all_books)
+    self.settings:set("shelf_cache", { books = all_books, time = os.time() })
+    self.settings:flush()
+
+    self.shelf_regular = {}
+    self.shelf_mp = {}
+    for _i, book in ipairs(all_books) do
+        if WeRead.is_mp_book(book.bookId) then
+            table.insert(self.shelf_mp, book)
+        else
+            table.insert(self.shelf_regular, book)
+        end
+    end
+    self.shelf_books = self.shelf_regular
+
+    -- Refresh the menu in place if the user is currently actively viewing it
+    if self.shelf_menu and UIManager:isSubwidgetShown(self.shelf_menu) then
+        local page_type = self._shelf_page_type
+        UIManager:close(self.shelf_menu)
+        if page_type == "tabs" then
+            self.shelf_menu = self:showShelfTabs()
+        elseif page_type == "regular" then
+            self.shelf_menu = self:showShelfPage()
+        elseif page_type == "mp" then
+            self.shelf_menu = self:showMPShelfPage()
+        else
+            if #self.shelf_mp > 0 then
+                self.shelf_menu = self:showShelfTabs()
+            else
+                self.shelf_menu = self:showShelfPage()
+            end
+        end
+        local Notification = require("ui/widget/notification")
+        Notification:notify(_("WeRead: Bookshelf updated"), Notification.SOURCE_ALWAYS_SHOW)
+    end
+end
+
 function WeReadPlugin:refreshBookshelfInBackground()
     local NetworkMgr = require("ui/network/manager")
     if not NetworkMgr:isOnline() then return end
 
-    local ok, result = pcall(function()
-        return self.client:gateway("/shelf/sync", {})
-    end)
-    if ok and result and result.books then
-        local all_books = result.books
-        self.settings:set("shelf_cache", { books = all_books, time = os.time() })
-        self.settings:flush()
+    if self._shelf_refreshing then return end
+    self._shelf_refreshing = true
 
-        self.shelf_regular = {}
-        self.shelf_mp = {}
-        for _i, book in ipairs(all_books) do
-            if WeRead.is_mp_book(book.bookId) then
-                table.insert(self.shelf_mp, book)
-            else
-                table.insert(self.shelf_regular, book)
-            end
+    local api_key = self.settings:get("api_key", "")
+    if api_key == "" then
+        self._shelf_refreshing = false
+        return
+    end
+
+    local Device = require("device")
+    local lfs = require("libs/libkoreader-lfs")
+    local json = require("json")
+
+    -- Check if curl is available
+    local has_curl = os.execute("curl --version >/dev/null 2>&1") == 0
+
+    if has_curl and not Device:isAndroid() then
+        -- True async using background shell process
+        local req_file = os.tmpname()
+        local res_file = req_file .. "_res"
+        local done_file = req_file .. "_done"
+
+        local payload = {
+            api_name = "/shelf/sync",
+            skill_version = WeRead.SKILL_VERSION
+        }
+
+        local f = io.open(req_file, "w")
+        if f then
+            f:write(json.encode(payload))
+            f:close()
+        else
+            self._shelf_refreshing = false
+            return
         end
-        self.shelf_books = self.shelf_regular
 
-        -- Refresh the menu in place if the user is currently actively viewing it
-        if self.shelf_menu and UIManager:isSubwidgetShown(self.shelf_menu) then
-            local page_type = self._shelf_page_type
-            UIManager:close(self.shelf_menu)
-            if page_type == "tabs" then
-                self.shelf_menu = self:showShelfTabs()
-            elseif page_type == "regular" then
-                self.shelf_menu = self:showShelfPage()
-            elseif page_type == "mp" then
-                self.shelf_menu = self:showMPShelfPage()
-            else
-                if #self.shelf_mp > 0 then
-                    self.shelf_menu = self:showShelfTabs()
-                else
-                    self.shelf_menu = self:showShelfPage()
+        os.remove(res_file)
+        os.remove(done_file)
+
+        local cmd = string.format(
+            "( curl -s -S -L -X POST --connect-timeout 5 --max-time 15" ..
+            " -H 'Content-Type: application/json;charset=UTF-8'" ..
+            " -H 'Accept: application/json, text/plain, */*'" ..
+            " -H 'Origin: https://weread.qq.com'" ..
+            " -H 'Referer: https://weread.qq.com/'" ..
+            " -H 'User-Agent: %s'" ..
+            " -H 'Authorization: Bearer %s'" ..
+            " -d @%s 'https://i.weread.qq.com/api/agent/gateway' > %s ; echo $? > %s ) >/dev/null 2>&1 &",
+            WeRead.USER_AGENT, api_key, req_file, res_file, done_file
+        )
+        os.execute(cmd)
+
+        local max_polls = 200 -- 20 seconds
+        local polls = 0
+        local function poll()
+            polls = polls + 1
+            if lfs.attributes(done_file, "mode") == "file" then
+                local sf = io.open(done_file, "r")
+                local status = sf and sf:read("*l") or ""
+                if sf then sf:close() end
+
+                local rf = io.open(res_file, "r")
+                local res_str = rf and rf:read("*a") or ""
+                if rf then rf:close() end
+
+                os.remove(req_file)
+                os.remove(res_file)
+                os.remove(done_file)
+
+                self._shelf_refreshing = false
+
+                if status == "0" and res_str ~= "" then
+                    local ok, parsed = pcall(json.decode, res_str)
+                    if ok and type(parsed) == "table" and parsed.books then
+                        self:_applyShelfData(parsed.books)
+                    end
                 end
+            elseif polls < max_polls then
+                UIManager:scheduleIn(0.1, poll)
+            else
+                self._shelf_refreshing = false
+                os.remove(req_file)
+                os.remove(res_file)
+                os.remove(done_file)
             end
-            local Notification = require("ui/widget/notification")
-            Notification:notify(_("WeRead: Bookshelf updated"), Notification.SOURCE_ALWAYS_SHOW)
         end
+        UIManager:scheduleIn(0.1, poll)
+    else
+        -- Fallback to synchronous HTTP request
+        UIManager:scheduleIn(0.1, function()
+            local ok, result = pcall(function()
+                return self.client:gateway("/shelf/sync", {})
+            end)
+            self._shelf_refreshing = false
+            if ok and result and result.books then
+                self:_applyShelfData(result.books)
+            end
+        end)
     end
 end
 
